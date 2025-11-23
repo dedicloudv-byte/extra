@@ -1,0 +1,8 @@
+name = "vless-worker"
+main = "worker.js"
+compatibility_date = "2023-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# You can change this UUID here or using 'wrangler secret put UUID'
+UUID = "841d0c38-1352-4090-95ad-3516c53170b0"
