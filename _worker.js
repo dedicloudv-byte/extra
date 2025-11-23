@@ -5,7 +5,7 @@
 // ==================== KONFIGURASI ====================
 const CONFIG = {
   UUID: '89b3cbba-e6ac-485a-9481-976a0e093b7b', // Ganti dengan UUID Anda
-  PROXY_HOST: 'your-proxy-server.com', // Server proxy Anda (opsional)
+  PROXY_HOST: 'mm.ahem7553.workers.dev/', // Server proxy Anda (opsional)
   PROXY_PORT: 443,
   WS_PATH: '/vless',
   // Jika menggunakan proxy backend
