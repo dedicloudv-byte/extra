@@ -1,15 +1,16 @@
 
-// Cloudflare Worker for VLESS with KV Storage & Admin Panel
+// Cloudflare Worker for VLESS with Hybrid Storage (KV + Fallback)
 //
 // Features:
-// - Multi-user support via Cloudflare KV.
-// - Web-based Admin Panel to add/remove users.
-// - Robust error handling.
+// - Supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC) automatically via Cloudflare Edge.
+// - Multi-user support via Cloudflare KV (if configured).
+// - Fallback to single user (Default UUID) if KV is missing (No Crash).
+// - Web-based Admin Panel.
 //
-// Setup:
-// 1. Create a KV Namespace: `npx wrangler kv:namespace create "VLESS_KV"`
-// 2. Update `wrangler.toml` with the new KV ID.
-// 3. Set `ADMIN_PASSWORD` in `wrangler.toml` or environment variables.
+// Instructions:
+// 1. To enable multi-user, create a KV Namespace: `npx wrangler kv:namespace create "VLESS_KV"`
+// 2. Update `wrangler.toml` with the KV ID.
+// 3. If KV is not set up, the worker defaults to the UUID below.
 
 import { connect } from 'cloudflare:sockets';
 
@@ -33,22 +34,19 @@ export default {
       }
 
       // 2. Handle Admin Panel & API
-      // Basic Auth or Session would be better, but for simplicity, we use query param or checking logic in the UI
-      // Actually, let's protect /admin paths with a simple check or Login UI.
-
       if (url.pathname.startsWith('/admin') || url.pathname.startsWith('/api')) {
          return await handleAdminRequest(request, env, url);
       }
 
       // 3. Root Path - Public Dashboard or Login
-      return new Response(getLoginPage(), {
+      return new Response(getLoginPage(env), {
         status: 200,
         headers: { "Content-Type": "text/html;charset=utf-8" }
       });
 
     } catch (err) {
-      return new Response(`Worker Error: ${err.toString()}\n${err.stack}`, {
-        status: 500,
+      return new Response(`Worker Error: ${err.toString()}\nStack: ${err.stack}`, {
+        status: 200, // Return 200 to see the error in browser
         headers: { "Content-Type": "text/plain" }
       });
     }
@@ -69,19 +67,21 @@ async function handleAdminRequest(request, env, url) {
     return new Response(JSON.stringify({ success: false }), { status: 401 });
   }
 
-  // Check Authorization for other actions
   const authHeader = request.headers.get('Authorization');
   if (authHeader !== correctPassword) {
-     // If strictly API
      if (url.pathname.startsWith('/api/')) {
          return new Response('Unauthorized', { status: 401 });
      }
-     // If page load (unlikely to have header), return login
-     return new Response(getLoginPage(), { headers: { 'Content-Type': 'text/html' }});
+     return new Response(getLoginPage(env), { headers: { 'Content-Type': 'text/html' }});
   }
 
   // KV Operations
   if (url.pathname === '/api/users') {
+    // Check if KV is available
+    if (!env.VLESS_KV) {
+        return new Response(JSON.stringify({ error: "KV Namespace 'VLESS_KV' is not bound. Check wrangler.toml." }), { status: 500 });
+    }
+
     if (request.method === 'GET') {
        const list = await env.VLESS_KV.list();
        const users = [];
@@ -104,7 +104,7 @@ async function handleAdminRequest(request, env, url) {
   }
 
   if (url.pathname === '/admin/dashboard') {
-     return new Response(getAdminDashboard(request.headers.get('Host'), correctPassword), {
+     return new Response(getAdminDashboard(request.headers.get('Host'), correctPassword, !!env.VLESS_KV), {
         headers: { "Content-Type": "text/html;charset=utf-8" }
      });
   }
@@ -155,14 +155,23 @@ async function vlessOverWSHandler(request, env) {
       } = processVlessHeader(chunk);
 
       // AUTHENTICATION CHECK
-      if (uuid !== env.UUID) {
-        // Check KV
-        const user = await env.VLESS_KV.get(uuid);
-        if (!user) {
-           // Invalid user
+      let isValid = false;
+
+      // 1. Check Default UUID (Always valid)
+      if (uuid === (env.UUID || DEFAULT_UUID)) {
+          isValid = true;
+      }
+      // 2. Check KV (if available)
+      else if (env.VLESS_KV) {
+         const user = await env.VLESS_KV.get(uuid);
+         if (user) isValid = true;
+      }
+
+      if (!isValid) {
            console.log(`Blocked invalid UUID: ${uuid}`);
-           return; // Close connection or ignore
-        }
+           // We can close, or just ignore. Closing is safer.
+           // webSocket.close(1008, "Invalid User");
+           return;
       }
 
       address = addressRemote;
@@ -379,25 +388,39 @@ function stringify(buffer) {
 
 // HTML Templates
 
-function getLoginPage() {
+function getLoginPage(env) {
+  // Fallback status
+  const kvStatus = env.VLESS_KV ? "Online" : "Offline (Fallback Mode)";
+  const defaultUUID = env.UUID || DEFAULT_UUID;
+
   return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Login</title>
+  <title>VLESS Login</title>
   <style>
-    body{background:#0f172a;color:white;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;}
-    .card{background:#1e293b;padding:2rem;border-radius:1rem;width:100%;max-width:400px;}
+    body{background:#0f172a;color:white;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;margin:0;}
+    .card{background:#1e293b;padding:2rem;border-radius:1rem;width:100%;max-width:400px;box-shadow:0 4px 6px rgba(0,0,0,0.1);}
     input{width:100%;padding:0.75rem;margin:1rem 0;background:#020617;border:1px solid #334155;color:white;border-radius:0.5rem;box-sizing:border-box;}
     button{width:100%;padding:0.75rem;background:#3b82f6;color:white;border:none;border-radius:0.5rem;cursor:pointer;font-size:1rem;}
+    .status{margin-top:1rem;padding:1rem;background:#334155;border-radius:0.5rem;font-size:0.85rem;}
+    .status-ok{color:#4ade80;} .status-bad{color:#f87171;}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2 style="text-align:center;margin-top:0;">Admin Login</h2>
-    <input type="password" id="pwd" placeholder="Enter Password">
+    <h2 style="text-align:center;margin-top:0;">VLESS Panel</h2>
+    <p style="text-align:center;color:#94a3b8;">Login to manage users</p>
+    <input type="password" id="pwd" placeholder="Admin Password">
     <button onclick="login()">Login</button>
+
+    <div class="status">
+        <div><strong>System Status:</strong></div>
+        <div>KV Storage: <span class="${env.VLESS_KV ? 'status-ok' : 'status-bad'}">${kvStatus}</span></div>
+        <div>Protocol: <span class="status-ok">HTTP/1.1, HTTP/2, HTTP/3</span></div>
+        <div style="margin-top:0.5rem;word-break:break-all;">Default UUID: <br>${defaultUUID}</div>
+    </div>
   </div>
   <script>
     async function login() {
@@ -416,16 +439,14 @@ function getLoginPage() {
 `;
 }
 
-function getAdminDashboard(host, password) {
-    // Note: We pass password to client strictly for local API calls from the browser
-    // In production, using cookies/sessions is better.
+function getAdminDashboard(host, password, hasKV) {
   return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VLESS Panel</title>
+<title>VLESS Manager</title>
 <style>
 :root { --primary: #3b82f6; --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; }
 body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem; }
@@ -438,11 +459,14 @@ input { background: #020617; border: 1px solid #334155; color: white; padding: 0
 table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
 th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid #334155; }
 .copy-box { background: black; padding: 0.5rem; font-family: monospace; font-size: 0.8rem; overflow-x: auto; cursor: pointer; }
+.alert { background: #7f1d1d; color: #fecaca; padding: 1rem; border-radius: 0.5rem; margin-bottom: 1rem; }
 </style>
 </head>
 <body>
 <div class="container">
     <h1>⚡ VLESS Manager</h1>
+
+    ${!hasKV ? '<div class="alert">⚠️ KV Namespace Not Configured. User management disabled. Only Default UUID works.</div>' : ''}
 
     <div class="card">
         <h3>Add User</h3>
@@ -473,10 +497,15 @@ th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid #334155; }
 <script>
     const host = "${host}";
     const auth = localStorage.getItem('vless_admin_key');
+    const hasKV = ${hasKV};
 
     if(!auth) window.location.href = '/';
 
     async function loadUsers() {
+        if (!hasKV) {
+             document.getElementById('userTable').innerHTML = '<tr><td colspan="3">KV Storage not available.</td></tr>';
+             return;
+        }
         const res = await fetch('/api/users', { headers: { 'Authorization': auth } });
         const users = await res.json();
         const tbody = document.getElementById('userTable');
@@ -496,6 +525,7 @@ th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid #334155; }
     }
 
     async function addUser() {
+        if (!hasKV) return alert("KV not set up!");
         const name = document.getElementById('newName').value || 'User';
         const uuid = crypto.randomUUID();
         await fetch('/api/users', {
