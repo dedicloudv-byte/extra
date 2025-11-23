@@ -1,16 +1,19 @@
 
-// Cloudflare Worker for VLESS
-// Supports VLESS over WebSocket
+// Cloudflare Worker for VLESS with KV Storage & Admin Panel
 //
-// Instructions:
-// 1. Set your UUID in the script below or in Cloudflare Worker Environment Variables as 'UUID'.
-// 2. Deploy to Cloudflare Workers.
-// 3. Access the worker URL to see the dashboard and get config links.
+// Features:
+// - Multi-user support via Cloudflare KV.
+// - Web-based Admin Panel to add/remove users.
+// - Robust error handling.
+//
+// Setup:
+// 1. Create a KV Namespace: `npx wrangler kv:namespace create "VLESS_KV"`
+// 2. Update `wrangler.toml` with the new KV ID.
+// 3. Set `ADMIN_PASSWORD` in `wrangler.toml` or environment variables.
 
-// We use dynamic imports to prevent the worker from crashing at startup
-// if the environment doesn't support cloudflare:sockets immediately.
+import { connect } from 'cloudflare:sockets';
 
-const DEFAULT_USER_ID = '841d0c38-1352-4090-95ad-3516c53170b0';
+const DEFAULT_UUID = '841d0c38-1352-4090-95ad-3516c53170b0';
 
 export default {
   /**
@@ -21,39 +24,97 @@ export default {
    */
   async fetch(request, env, ctx) {
     try {
-      const userID = env.UUID || DEFAULT_USER_ID;
       const upgradeHeader = request.headers.get('Upgrade');
+      const url = new URL(request.url);
 
-      // Dashboard (Root Path)
-      if (!upgradeHeader || upgradeHeader !== 'websocket') {
-        const url = new URL(request.url);
-        switch (url.pathname) {
-          case '/':
-            return new Response(getDashboard(request.headers.get('Host'), userID), {
-              status: 200,
-              headers: {
-                "Content-Type": "text/html;charset=utf-8",
-              }
-            });
-          default:
-            return new Response('Not Found', { status: 404 });
-        }
+      // 1. Handle WebSocket (VLESS Traffic)
+      if (upgradeHeader === 'websocket') {
+        return await vlessOverWSHandler(request, env);
       }
 
-      // Handle WebSocket for VLESS
-      return await vlessOverWSHandler(request, userID);
+      // 2. Handle Admin Panel & API
+      // Basic Auth or Session would be better, but for simplicity, we use query param or checking logic in the UI
+      // Actually, let's protect /admin paths with a simple check or Login UI.
+
+      if (url.pathname.startsWith('/admin') || url.pathname.startsWith('/api')) {
+         return await handleAdminRequest(request, env, url);
+      }
+
+      // 3. Root Path - Public Dashboard or Login
+      return new Response(getLoginPage(), {
+        status: 200,
+        headers: { "Content-Type": "text/html;charset=utf-8" }
+      });
 
     } catch (err) {
-      // Catch any runtime errors and return them as a visible response
-      return new Response(`Worker Error (Handled): ${err.toString()}\nstack: ${err.stack}`, {
-        status: 200,
+      return new Response(`Worker Error: ${err.toString()}\n${err.stack}`, {
+        status: 500,
         headers: { "Content-Type": "text/plain" }
       });
     }
   },
 };
 
-async function vlessOverWSHandler(request, userID) {
+// --- Admin & UI Logic ---
+
+async function handleAdminRequest(request, env, url) {
+  const correctPassword = env.ADMIN_PASSWORD || 'admin';
+
+  // Simple API for the frontend
+  if (url.pathname === '/api/login') {
+    const { password } = await request.json();
+    if (password === correctPassword) {
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' }});
+    }
+    return new Response(JSON.stringify({ success: false }), { status: 401 });
+  }
+
+  // Check Authorization for other actions
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader !== correctPassword) {
+     // If strictly API
+     if (url.pathname.startsWith('/api/')) {
+         return new Response('Unauthorized', { status: 401 });
+     }
+     // If page load (unlikely to have header), return login
+     return new Response(getLoginPage(), { headers: { 'Content-Type': 'text/html' }});
+  }
+
+  // KV Operations
+  if (url.pathname === '/api/users') {
+    if (request.method === 'GET') {
+       const list = await env.VLESS_KV.list();
+       const users = [];
+       for (const key of list.keys) {
+         const meta = await env.VLESS_KV.get(key.name);
+         users.push({ uuid: key.name, name: meta });
+       }
+       return new Response(JSON.stringify(users));
+    }
+    if (request.method === 'POST') {
+       const { uuid, name } = await request.json();
+       await env.VLESS_KV.put(uuid, name || 'User');
+       return new Response(JSON.stringify({ success: true }));
+    }
+    if (request.method === 'DELETE') {
+       const { uuid } = await request.json();
+       await env.VLESS_KV.delete(uuid);
+       return new Response(JSON.stringify({ success: true }));
+    }
+  }
+
+  if (url.pathname === '/admin/dashboard') {
+     return new Response(getAdminDashboard(request.headers.get('Host'), correctPassword), {
+        headers: { "Content-Type": "text/html;charset=utf-8" }
+     });
+  }
+
+  return new Response('Not Found', { status: 404 });
+}
+
+// --- VLESS Logic ---
+
+async function vlessOverWSHandler(request, env) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
 
@@ -73,7 +134,6 @@ async function vlessOverWSHandler(request, userID) {
     value: null,
   };
 
-  // VLESS processing
   readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk, controller) {
       if (remoteSocketWrapper.value) {
@@ -91,20 +151,29 @@ async function vlessOverWSHandler(request, userID) {
         rawDataIndex,
         vlessVersion = new Uint8Array([0, 0]),
         isUDP,
-      } = processVlessHeader(chunk, userID);
+        uuid
+      } = processVlessHeader(chunk);
+
+      // AUTHENTICATION CHECK
+      if (uuid !== env.UUID) {
+        // Check KV
+        const user = await env.VLESS_KV.get(uuid);
+        if (!user) {
+           // Invalid user
+           console.log(`Blocked invalid UUID: ${uuid}`);
+           return; // Close connection or ignore
+        }
+      }
 
       address = addressRemote;
       portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '}`;
       if (hasError) {
-        // log(message);
         return;
       }
 
-      // Prepeare response header
       const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
       const rawClientData = chunk.slice(rawDataIndex);
 
-      // Handle TCP Outbound
       await handleTCPOutBound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
     },
     close() {
@@ -123,29 +192,9 @@ async function vlessOverWSHandler(request, userID) {
   });
 }
 
-/**
- * Helper to safely get the connect function
- */
-async function getSocketConnect() {
-    // Try standard global connect
-    if (typeof connect === 'function') {
-        return connect;
-    }
-    // Try importing from cloudflare:sockets
-    try {
-        // @ts-ignore
-        const module = await import('cloudflare:sockets');
-        return module.connect;
-    } catch (e) {
-        throw new Error("Unable to find 'connect' function. Ensure 'nodejs_compat' flag is set in wrangler.toml or Compatibility Flags.");
-    }
-}
-
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log) {
-  const connectFn = await getSocketConnect();
-
   async function connectAndWrite(address, port) {
-    const tcpSocket = connectFn({
+    const tcpSocket = connect({
       hostname: address,
       port: port,
     });
@@ -158,16 +207,12 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
   }
 
   const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-
   await vlessRemoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
 }
 
 async function vlessRemoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
   let hasHeaderSent = false;
-
   await remoteSocket.readable.pipeTo(new WritableStream({
-    start() {
-    },
     async write(chunk, controller) {
       if (hasHeaderSent) {
         webSocket.send(chunk);
@@ -230,8 +275,6 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         controller.enqueue(earlyData);
       }
     },
-    pull(controller) {
-    },
     cancel(reason) {
       if (readableStreamCancel) {
         return;
@@ -241,47 +284,21 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
       safeCloseWebSocket(webSocketServer);
     }
   });
-
   return stream;
 }
 
-function processVlessHeader(vlessBuffer, userID) {
+function processVlessHeader(vlessBuffer) {
   if (vlessBuffer.byteLength < 24) {
-    return {
-      hasError: true,
-      message: 'invalid data',
-    };
+    return { hasError: true, message: 'invalid data' };
   }
   const version = new Uint8Array(vlessBuffer.slice(0, 1));
-  let isValidUser = false;
-  let isUDP = false;
-
   const uuid = stringify(new Uint8Array(vlessBuffer.slice(1, 17)));
-  if (uuid === userID) {
-      isValidUser = true;
-  }
-
-  if (!isValidUser) {
-    return {
-      hasError: true,
-      message: 'invalid user',
-    };
-  }
-
   const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+  const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
 
-  const command = new Uint8Array(
-    vlessBuffer.slice(18 + optLength, 18 + optLength + 1)
-  )[0];
-
-  if (command === 1) {
-  } else if (command === 2) {
-    isUDP = true;
-  } else {
-    return {
-      hasError: true,
-      message: `command ${command} is not support, command 01-tcp, 02-udp `,
-    };
+  let isUDP = command === 2;
+  if (command !== 1 && command !== 2) {
+    return { hasError: true, message: `command ${command} is not support` };
   }
 
   const portIndex = 18 + optLength + 1;
@@ -289,35 +306,26 @@ function processVlessHeader(vlessBuffer, userID) {
   const portRemote = portDecoder.getUint16(0);
 
   let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(
-    vlessBuffer.slice(addressIndex, addressIndex + 1)
-  );
+  const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
 
   const addressType = addressBuffer[0];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = '';
+
   switch (addressType) {
     case 1:
       addressLength = 4;
-      addressValue = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
-      ).join('.');
+      addressValue = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join('.');
       break;
     case 2:
-      addressLength = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + 1)
-      )[0];
+      addressLength = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
       addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
-      );
+      addressValue = new TextDecoder().decode(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
     case 3:
       addressLength = 16;
-      const dataView = new DataView(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
-      );
+      const dataView = new DataView(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
@@ -325,16 +333,7 @@ function processVlessHeader(vlessBuffer, userID) {
       addressValue = ipv6.join(':');
       break;
     default:
-      return {
-        hasError: true,
-        message: `invild  addressType is ${addressType}`,
-      };
-  }
-  if (!addressValue) {
-    return {
-      hasError: true,
-      message: `addressValue is empty, addressType is ${addressType}`,
-    };
+      return { hasError: true, message: `invild addressType is ${addressType}` };
   }
 
   return {
@@ -345,6 +344,7 @@ function processVlessHeader(vlessBuffer, userID) {
     rawDataIndex: addressValueIndex + addressLength,
     vlessVersion: version,
     isUDP,
+    uuid
   };
 }
 
@@ -368,309 +368,179 @@ function stringify(buffer) {
         byteToHex.push((i + 0x100).toString(16).substr(1));
     }
     const r = buffer;
-    const uuid = [
+    return [
         byteToHex[r[0]], byteToHex[r[1]], byteToHex[r[2]], byteToHex[r[3]], '-',
         byteToHex[r[4]], byteToHex[r[5]], '-',
         byteToHex[r[6]], byteToHex[r[7]], '-',
         byteToHex[r[8]], byteToHex[r[9]], '-',
         byteToHex[r[10]], byteToHex[r[11]], byteToHex[r[12]], byteToHex[r[13]], byteToHex[r[14]], byteToHex[r[15]]
     ].join('');
-    return uuid;
 }
 
-function getDashboard(host, userID) {
+// HTML Templates
+
+function getLoginPage() {
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login</title>
+  <style>
+    body{background:#0f172a;color:white;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;}
+    .card{background:#1e293b;padding:2rem;border-radius:1rem;width:100%;max-width:400px;}
+    input{width:100%;padding:0.75rem;margin:1rem 0;background:#020617;border:1px solid #334155;color:white;border-radius:0.5rem;box-sizing:border-box;}
+    button{width:100%;padding:0.75rem;background:#3b82f6;color:white;border:none;border-radius:0.5rem;cursor:pointer;font-size:1rem;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="text-align:center;margin-top:0;">Admin Login</h2>
+    <input type="password" id="pwd" placeholder="Enter Password">
+    <button onclick="login()">Login</button>
+  </div>
+  <script>
+    async function login() {
+      const pwd = document.getElementById('pwd').value;
+      const res = await fetch('/api/login', { method: 'POST', body: JSON.stringify({password: pwd}) });
+      if(res.ok) {
+        localStorage.setItem('vless_admin_key', pwd);
+        window.location.href = '/admin/dashboard';
+      } else {
+        alert('Invalid Password');
+      }
+    }
+  </script>
+</body>
+</html>
+`;
+}
+
+function getAdminDashboard(host, password) {
+    // Note: We pass password to client strictly for local API calls from the browser
+    // In production, using cookies/sessions is better.
   return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VLESS Cloudflare Worker</title>
+<title>VLESS Panel</title>
 <style>
-:root {
-    --primary: #3b82f6;
-    --bg: #0f172a;
-    --card: #1e293b;
-    --text: #e2e8f0;
-    --text-muted: #94a3b8;
-}
-body {
-    font-family: system-ui, -apple-system, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    margin: 0;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 2rem 1rem;
-}
-.container {
-    max-width: 800px;
-    width: 100%;
-}
-h1 {
-    text-align: center;
-    margin-bottom: 2rem;
-    background: linear-gradient(to right, #60a5fa, #a78bfa);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-}
-.card {
-    background: var(--card);
-    border-radius: 1rem;
-    padding: 1.5rem;
-    margin-bottom: 1.5rem;
-    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
-    border: 1px solid #334155;
-}
-.card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1rem;
-    border-bottom: 1px solid #334155;
-    padding-bottom: 1rem;
-}
-.card-title {
-    font-size: 1.25rem;
-    font-weight: 600;
-    color: #f8fafc;
-    margin: 0;
-}
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    gap: 1rem;
-}
-.info-item {
-    background: rgba(0,0,0,0.2);
-    padding: 1rem;
-    border-radius: 0.5rem;
-    overflow: hidden;
-}
-.label {
-    color: var(--text-muted);
-    font-size: 0.875rem;
-    margin-bottom: 0.25rem;
-}
-.value {
-    font-family: monospace;
-    word-break: break-all;
-}
-.input-group {
-    margin-bottom: 1rem;
-}
-input {
-    width: 100%;
-    background: #020617;
-    border: 1px solid #334155;
-    padding: 0.75rem;
-    border-radius: 0.5rem;
-    color: white;
-    box-sizing: border-box;
-    margin-top: 0.5rem;
-}
-button {
-    background: var(--primary);
-    color: white;
-    border: none;
-    padding: 0.5rem 1rem;
-    border-radius: 0.5rem;
-    cursor: pointer;
-    font-weight: 500;
-    transition: opacity 0.2s;
-}
-button:hover {
-    opacity: 0.9;
-}
-.config-box {
-    background: #020617;
-    padding: 1rem;
-    border-radius: 0.5rem;
-    font-family: monospace;
-    font-size: 0.875rem;
-    word-break: break-all;
-    margin-bottom: 1rem;
-    border: 1px solid #334155;
-    max-height: 100px;
-    overflow-y: auto;
-}
-.tabs {
-    display: flex;
-    gap: 1rem;
-    margin-bottom: 1rem;
-}
-.tab {
-    padding: 0.5rem 1rem;
-    border-radius: 0.5rem;
-    cursor: pointer;
-    background: transparent;
-    border: 1px solid #334155;
-}
-.tab.active {
-    background: var(--primary);
-    border-color: var(--primary);
-}
+:root { --primary: #3b82f6; --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; }
+body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem; }
+.container { max-width: 800px; margin: 0 auto; }
+h1 { text-align: center; color: #60a5fa; }
+.card { background: var(--card); border-radius: 1rem; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid #334155; }
+.btn { background: var(--primary); color: white; border: none; padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; }
+.btn-danger { background: #ef4444; }
+input { background: #020617; border: 1px solid #334155; color: white; padding: 0.5rem; border-radius: 0.5rem; }
+table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid #334155; }
+.copy-box { background: black; padding: 0.5rem; font-family: monospace; font-size: 0.8rem; overflow-x: auto; cursor: pointer; }
 </style>
 </head>
 <body>
 <div class="container">
-    <h1>⚡ VLESS Worker Dashboard</h1>
+    <h1>⚡ VLESS Manager</h1>
 
     <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">Server Information</h2>
-        </div>
-        <div class="grid">
-            <div class="info-item">
-                <div class="label">Host Domain</div>
-                <div class="value" id="host-display">${host}</div>
-            </div>
-            <div class="info-item">
-                <div class="label">UUID</div>
-                <div class="value">${userID}</div>
-            </div>
+        <h3>Add User</h3>
+        <div style="display:flex;gap:1rem;">
+            <input type="text" id="newName" placeholder="User Name (e.g. User1)" style="flex:1;">
+            <button class="btn" onclick="addUser()">Generate & Add</button>
         </div>
     </div>
 
     <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">Configuration Generator</h2>
-        </div>
-
-        <div class="input-group">
-            <label class="label">Custom Address (SNI / ISP Bug) - Optional</label>
-            <input type="text" id="sni-input" placeholder="e.g., tsel.me, quiz.vidio.com" onkeyup="updateConfigs()">
-        </div>
-
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('tls')">TLS (443)</button>
-            <button class="tab" onclick="switchTab('nontls')">No TLS (80)</button>
-        </div>
-
-        <div id="tls-content">
-            <div class="label">VLESS TLS Config</div>
-            <div class="config-box" id="vless-tls"></div>
-            <button onclick="copyToClipboard('vless-tls')">Copy TLS Config</button>
-        </div>
-
-        <div id="nontls-content" style="display: none;">
-            <div class="label">VLESS Non-TLS Config</div>
-            <div class="config-box" id="vless-nontls"></div>
-            <button onclick="copyToClipboard('vless-nontls')">Copy Non-TLS Config</button>
-        </div>
+        <h3>Active Users</h3>
+        <table>
+            <thead><tr><th>Name</th><th>UUID</th><th>Action</th></tr></thead>
+            <tbody id="userTable"></tbody>
+        </table>
     </div>
 
-    <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">Clash / Meta YAML</h2>
-        </div>
-        <div class="config-box" id="clash-config"></div>
-        <button onclick="copyToClipboard('clash-config')">Copy Clash Config</button>
+    <div class="card" id="configCard" style="display:none;">
+        <h3>Generated Config</h3>
+        <p>Sni/Bug Host:</p>
+        <input type="text" id="sni" placeholder="${host}" onkeyup="updateLinks()" style="width:100%;margin-bottom:1rem;">
+        <div class="copy-box" id="tlsLink" onclick="copy(this)"></div>
+        <div style="height:1rem;"></div>
+        <div class="copy-box" id="nontlsLink" onclick="copy(this)"></div>
     </div>
-
 </div>
 
 <script>
     const host = "${host}";
-    const uuid = "${userID}";
+    const auth = localStorage.getItem('vless_admin_key');
 
-    function updateConfigs() {
-        const sni = document.getElementById('sni-input').value || host;
-        const address = document.getElementById('sni-input').value ? '${host}' : host;
+    if(!auth) window.location.href = '/';
 
-        // TLS Config
-        const bug = document.getElementById('sni-input').value;
-
-        let tlsAddr = host;
-        let tlsSni = host;
-        let tlsHost = host;
-
-        if (bug) {
-             tlsAddr = bug;
-             tlsSni = host;
-             tlsHost = host;
-        }
-
-        const vlessTls = \`vless://\${uuid}@\${tlsAddr}:443?encryption=none&security=tls&sni=\${tlsSni}&fp=randomized&type=ws&host=\${tlsHost}&path=%2F#\${host}-TLS\`;
-
-        // Non-TLS Config
-
-        let nonTlsAddr = host;
-        let nonTlsHost = host;
-
-        if (bug) {
-            nonTlsAddr = bug;
-            nonTlsHost = host;
-        }
-
-        const vlessNonTls = \`vless://\${uuid}@\${nonTlsAddr}:80?encryption=none&security=none&type=ws&host=\${nonTlsHost}&path=%2F#\${host}-HTTP\`;
-
-        document.getElementById('vless-tls').textContent = vlessTls;
-        document.getElementById('vless-nontls').textContent = vlessNonTls;
-
-        // Clash Config
-        const clash = \`
-- name: \${host}-TLS
-  type: vless
-  server: \${tlsAddr}
-  port: 443
-  uuid: \${uuid}
-  cipher: auto
-  tls: true
-  udp: true
-  skip-cert-verify: true
-  network: ws
-  servername: \${tlsSni}
-  ws-opts:
-    path: /
-    headers:
-      Host: \${tlsHost}
-
-- name: \${host}-HTTP
-  type: vless
-  server: \${nonTlsAddr}
-  port: 80
-  uuid: \${uuid}
-  cipher: auto
-  tls: false
-  udp: true
-  skip-cert-verify: true
-  network: ws
-  ws-opts:
-    path: /
-    headers:
-      Host: \${nonTlsHost}
-\`;
-        document.getElementById('clash-config').textContent = clash.trim();
-    }
-
-    function switchTab(type) {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('#tls-content, #nontls-content').forEach(c => c.style.display = 'none');
-
-        if (type === 'tls') {
-            document.querySelector('button[onclick="switchTab(\\'tls\\')"]').classList.add('active');
-            document.getElementById('tls-content').style.display = 'block';
-        } else {
-            document.querySelector('button[onclick="switchTab(\\'nontls\\')"]').classList.add('active');
-            document.getElementById('nontls-content').style.display = 'block';
-        }
-    }
-
-    function copyToClipboard(id) {
-        const text = document.getElementById(id).textContent;
-        navigator.clipboard.writeText(text).then(() => {
-            const btn = document.querySelector(\`button[onclick="copyToClipboard('\${id}')"]\`);
-            const original = btn.textContent;
-            btn.textContent = 'Copied!';
-            setTimeout(() => btn.textContent = original, 2000);
+    async function loadUsers() {
+        const res = await fetch('/api/users', { headers: { 'Authorization': auth } });
+        const users = await res.json();
+        const tbody = document.getElementById('userTable');
+        tbody.innerHTML = '';
+        users.forEach(u => {
+            tbody.innerHTML += \`
+                <tr>
+                    <td>\${u.name}</td>
+                    <td>\${u.uuid}</td>
+                    <td>
+                        <button class="btn" onclick="showConfig('\${u.uuid}', '\${u.name}')">Link</button>
+                        <button class="btn btn-danger" onclick="deleteUser('\${u.uuid}')">Del</button>
+                    </td>
+                </tr>
+            \`;
         });
     }
 
-    // Init
-    updateConfigs();
+    async function addUser() {
+        const name = document.getElementById('newName').value || 'User';
+        const uuid = crypto.randomUUID();
+        await fetch('/api/users', {
+            method: 'POST',
+            headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uuid, name })
+        });
+        loadUsers();
+        document.getElementById('newName').value = '';
+    }
+
+    async function deleteUser(uuid) {
+        if(!confirm('Delete this user?')) return;
+        await fetch('/api/users', {
+            method: 'DELETE',
+            headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uuid })
+        });
+        loadUsers();
+    }
+
+    let currentUUID = '';
+    function showConfig(uuid, name) {
+        currentUUID = uuid;
+        document.getElementById('configCard').style.display = 'block';
+        updateLinks();
+        window.scrollTo(0, document.body.scrollHeight);
+    }
+
+    function updateLinks() {
+        const sni = document.getElementById('sni').value || host;
+        // VLESS Link Generation
+        const tls = \`vless://\${currentUUID}@\${sni}:443?encryption=none&security=tls&sni=\${host}&fp=chrome&type=ws&host=\${host}&path=%2F#\${host}-TLS\`;
+        const nontls = \`vless://\${currentUUID}@\${sni}:80?encryption=none&security=none&type=ws&host=\${host}&path=%2F#\${host}-HTTP\`;
+
+        document.getElementById('tlsLink').textContent = tls;
+        document.getElementById('nontlsLink').textContent = nontls;
+    }
+
+    function copy(el) {
+        navigator.clipboard.writeText(el.textContent);
+        alert('Copied!');
+    }
+
+    loadUsers();
 </script>
 </body>
 </html>

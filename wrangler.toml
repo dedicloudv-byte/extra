@@ -3,8 +3,18 @@ main = "worker.js"
 compatibility_date = "2023-12-01"
 compatibility_flags = ["nodejs_compat"]
 
+# KV Namespace Binding
+# IMPORTANT: You must create a KV namespace and replace the 'id' below.
+# Run: npx wrangler kv:namespace create "VLESS_KV"
+# Then copy the 'id' from the output and paste it here.
+[[kv_namespaces]]
+binding = "VLESS_KV"
+id = "YOUR_KV_ID_HERE"
+
 [vars]
-# You can change this UUID here or using 'wrangler secret put UUID'
+# Password for the Admin Dashboard (https://your-worker.workers.dev/admin)
+ADMIN_PASSWORD = "admin"
+# Default UUID for fallback (optional)
 UUID = "841d0c38-1352-4090-95ad-3516c53170b0"
 
 [observability.logs]
