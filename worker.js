@@ -19,8 +19,8 @@ export default {
    * @returns {Promise<Response>}
    */
   async fetch(request, env, ctx) {
-    const userID = env.UUID || DEFAULT_USER_ID;
     try {
+      const userID = env.UUID || DEFAULT_USER_ID;
       const upgradeHeader = request.headers.get('Upgrade');
       if (!upgradeHeader || upgradeHeader !== 'websocket') {
         const url = new URL(request.url);
@@ -41,7 +41,12 @@ export default {
       return await vlessOverWSHandler(request, userID);
 
     } catch (err) {
-      return new Response(err.toString(), { status: 500 });
+      // Catch any runtime errors and return them as a visible response
+      // This prevents Error 1101 and allows debugging
+      return new Response(`Worker Error: ${err.toString()}\n${err.stack || ''}`, {
+        status: 200, // Use 200 to ensure the user sees the message
+        headers: { "Content-Type": "text/plain" }
+      });
     }
   },
 };
@@ -62,7 +67,7 @@ async function vlessOverWSHandler(request, userID) {
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
 
   /** @type {{ value: import("@cloudflare/workers-types").Socket | null}}*/
-  let remoteSocketWapper = {
+  let remoteSocketWrapper = {
     value: null,
   };
   let isDns = false;
@@ -70,8 +75,8 @@ async function vlessOverWSHandler(request, userID) {
   // VLESS processing
   readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk, controller) {
-      if (remoteSocketWapper.value) {
-        const writer = remoteSocketWapper.value.writable.getWriter();
+      if (remoteSocketWrapper.value) {
+        const writer = remoteSocketWrapper.value.writable.getWriter();
         await writer.write(chunk);
         writer.releaseLock();
         return;
@@ -90,6 +95,7 @@ async function vlessOverWSHandler(request, userID) {
       address = addressRemote;
       portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '}`;
       if (hasError) {
+        // controller.error(message);
         return;
       }
 
@@ -98,7 +104,7 @@ async function vlessOverWSHandler(request, userID) {
       const rawClientData = chunk.slice(rawDataIndex);
 
       // Handle TCP Outbound
-      await handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
+      await handleTCPOutBound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
     },
     close() {
       log(`readableWebSocketStream is close`);
@@ -559,9 +565,13 @@ button:hover {
     function updateConfigs() {
         const sni = document.getElementById('sni-input').value || host;
         const address = document.getElementById('sni-input').value ? '${host}' : host;
-        const serverForLink = document.getElementById('sni-input').value || host;
 
-        // TLS Config
+        // Logic for "ISP/Bug":
+        // Address: [Bug Domain]
+        // Port: 443
+        // SNI: [Worker Domain] (Usually needed so Cloudflare routes to correct worker)
+        // Host: [Worker Domain]
+
         const bug = document.getElementById('sni-input').value;
 
         let tlsAddr = host;
