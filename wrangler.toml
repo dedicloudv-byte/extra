@@ -9,7 +9,7 @@ compatibility_flags = ["nodejs_compat"]
 # Then copy the 'id' from the output and paste it here.
 [[kv_namespaces]]
 binding = "VLESS_KV"
-id = "YOUR_KV_ID_HERE"
+id = "8c066e6576f4492d97eacbbd6b9973f0"
 
 [vars]
 # Password for the Admin Dashboard (https://your-worker.workers.dev/admin)
