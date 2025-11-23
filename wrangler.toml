@@ -1,4 +1,4 @@
-name = "vless-worker"
+name = "vlessworker"
 main = "worker.js"
 compatibility_date = "2023-12-01"
 compatibility_flags = ["nodejs_compat"]
