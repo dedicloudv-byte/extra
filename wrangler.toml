@@ -6,3 +6,9 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 # You can change this UUID here or using 'wrangler secret put UUID'
 UUID = "841d0c38-1352-4090-95ad-3516c53170b0"
+
+[observability.logs]
+enabled = false
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
