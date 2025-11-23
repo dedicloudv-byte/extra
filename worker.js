@@ -7,7 +7,8 @@
 // 2. Deploy to Cloudflare Workers.
 // 3. Access the worker URL to see the dashboard and get config links.
 
-import { connect } from 'cloudflare:sockets';
+// We use dynamic imports to prevent the worker from crashing at startup
+// if the environment doesn't support cloudflare:sockets immediately.
 
 const DEFAULT_USER_ID = '841d0c38-1352-4090-95ad-3516c53170b0';
 
@@ -22,6 +23,8 @@ export default {
     try {
       const userID = env.UUID || DEFAULT_USER_ID;
       const upgradeHeader = request.headers.get('Upgrade');
+
+      // Dashboard (Root Path)
       if (!upgradeHeader || upgradeHeader !== 'websocket') {
         const url = new URL(request.url);
         switch (url.pathname) {
@@ -42,9 +45,8 @@ export default {
 
     } catch (err) {
       // Catch any runtime errors and return them as a visible response
-      // This prevents Error 1101 and allows debugging
-      return new Response(`Worker Error: ${err.toString()}\n${err.stack || ''}`, {
-        status: 200, // Use 200 to ensure the user sees the message
+      return new Response(`Worker Error (Handled): ${err.toString()}\nstack: ${err.stack}`, {
+        status: 200,
         headers: { "Content-Type": "text/plain" }
       });
     }
@@ -70,7 +72,6 @@ async function vlessOverWSHandler(request, userID) {
   let remoteSocketWrapper = {
     value: null,
   };
-  let isDns = false;
 
   // VLESS processing
   readableWebSocketStream.pipeTo(new WritableStream({
@@ -95,7 +96,7 @@ async function vlessOverWSHandler(request, userID) {
       address = addressRemote;
       portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '}`;
       if (hasError) {
-        // controller.error(message);
+        // log(message);
         return;
       }
 
@@ -123,11 +124,83 @@ async function vlessOverWSHandler(request, userID) {
 }
 
 /**
- *
- * @param {import("@cloudflare/workers-types").WebSocket} webSocketServer
- * @param {string} earlyDataHeader
- * @param {(info: string)=> void} log
+ * Helper to safely get the connect function
  */
+async function getSocketConnect() {
+    // Try standard global connect
+    if (typeof connect === 'function') {
+        return connect;
+    }
+    // Try importing from cloudflare:sockets
+    try {
+        // @ts-ignore
+        const module = await import('cloudflare:sockets');
+        return module.connect;
+    } catch (e) {
+        throw new Error("Unable to find 'connect' function. Ensure 'nodejs_compat' flag is set in wrangler.toml or Compatibility Flags.");
+    }
+}
+
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log) {
+  const connectFn = await getSocketConnect();
+
+  async function connectAndWrite(address, port) {
+    const tcpSocket = connectFn({
+      hostname: address,
+      port: port,
+    });
+    remoteSocket.value = tcpSocket;
+    log(`connected to ${address}:${port}`);
+    const writer = tcpSocket.writable.getWriter();
+    await writer.write(rawClientData);
+    writer.releaseLock();
+    return tcpSocket;
+  }
+
+  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+
+  await vlessRemoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+}
+
+async function vlessRemoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
+  let hasHeaderSent = false;
+
+  await remoteSocket.readable.pipeTo(new WritableStream({
+    start() {
+    },
+    async write(chunk, controller) {
+      if (hasHeaderSent) {
+        webSocket.send(chunk);
+      } else {
+        const newChunk = new Uint8Array(vlessResponseHeader.length + chunk.byteLength);
+        newChunk.set(vlessResponseHeader);
+        newChunk.set(chunk, vlessResponseHeader.length);
+        webSocket.send(newChunk);
+        hasHeaderSent = true;
+      }
+    },
+    close() {
+      log(`remoteConnection!.readable is close`);
+    },
+    abort(reason) {
+      console.error(`remoteConnection!.readable abort`, reason);
+    },
+  })).catch((err) => {
+    console.error(`remoteSocketToWS error:`, err);
+    safeCloseWebSocket(webSocket);
+  });
+}
+
+function safeCloseWebSocket(socket) {
+  try {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+      socket.close();
+    }
+  } catch (e) {
+    console.error('safeCloseWebSocket error', e);
+  }
+}
+
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   let readableStreamCancel = false;
   const stream = new ReadableStream({
@@ -273,65 +346,6 @@ function processVlessHeader(vlessBuffer, userID) {
     vlessVersion: version,
     isUDP,
   };
-}
-
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log,) {
-  async function connectAndWrite(address, port) {
-    // @ts-ignore
-    const tcpSocket = connect({
-      hostname: address,
-      port: port,
-    });
-    remoteSocket.value = tcpSocket;
-    log(`connected to ${address}:${port}`);
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
-    writer.releaseLock();
-    return tcpSocket;
-  }
-
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-
-  await vlessRemoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
-}
-
-async function vlessRemoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
-  let hasHeaderSent = false;
-
-  await remoteSocket.readable.pipeTo(new WritableStream({
-    start() {
-    },
-    async write(chunk, controller) {
-      if (hasHeaderSent) {
-        webSocket.send(chunk);
-      } else {
-        const newChunk = new Uint8Array(vlessResponseHeader.length + chunk.byteLength);
-        newChunk.set(vlessResponseHeader);
-        newChunk.set(chunk, vlessResponseHeader.length);
-        webSocket.send(newChunk);
-        hasHeaderSent = true;
-      }
-    },
-    close() {
-      log(`remoteConnection!.readable is close`);
-    },
-    abort(reason) {
-      console.error(`remoteConnection!.readable abort`, reason);
-    },
-  })).catch((err) => {
-    console.error(`remoteSocketToWS error:`, err);
-    safeCloseWebSocket(webSocket);
-  });
-}
-
-function safeCloseWebSocket(socket) {
-  try {
-    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-      socket.close();
-    }
-  } catch (e) {
-    console.error('safeCloseWebSocket error', e);
-  }
 }
 
 function base64ToArrayBuffer(base64Str) {
@@ -566,12 +580,7 @@ button:hover {
         const sni = document.getElementById('sni-input').value || host;
         const address = document.getElementById('sni-input').value ? '${host}' : host;
 
-        // Logic for "ISP/Bug":
-        // Address: [Bug Domain]
-        // Port: 443
-        // SNI: [Worker Domain] (Usually needed so Cloudflare routes to correct worker)
-        // Host: [Worker Domain]
-
+        // TLS Config
         const bug = document.getElementById('sni-input').value;
 
         let tlsAddr = host;
