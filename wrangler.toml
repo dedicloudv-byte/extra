@@ -1,4 +1,4 @@
-name = "mm"
+name = "bc"
 main = "_worker.js"
 compatibility_date = "2023-12-01"
 compatibility_flags = ["nodejs_compat"]
